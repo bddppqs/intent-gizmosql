@@ -8,8 +8,8 @@ include(ExternalProject)
 ExternalProject_Add(
     duckdb_project
     PREFIX ${CMAKE_BINARY_DIR}/third_party
-    GIT_REPOSITORY https://github.com/duckdb/duckdb
-    GIT_TAG @DUCKDB_GIT_TAG@
+    GIT_REPOSITORY https://github.com/bddppqs/intent-duckdb
+    GIT_TAG v1.5.5-clickbench.1
     GIT_SHALLOW TRUE
     CMAKE_ARGS
           -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/third_party/duckdb
@@ -23,7 +23,7 @@ ExternalProject_Add(
           # the container root user), DuckDB silently builds as v0.0.1 and
           # every runtime extension INSTALL 404s against
           # extensions.duckdb.org/v0.0.1/.
-          -DOVERRIDE_GIT_DESCRIBE=@DUCKDB_GIT_TAG@
+          -DOVERRIDE_GIT_DESCRIBE=v1.5.5
           -DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER}
           -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
           "-DDUCKDB_EXTENSION_CONFIGS=${DUCKDB_EXTENSION_CONFIGS}"

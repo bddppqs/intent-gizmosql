@@ -1,0 +1,66 @@
+name: clickbench-release
+
+# Builds the portable Linux server and client for a ClickBench release tag and attaches them,
+# with checksums, to the GitHub release of that tag. Self-contained: no external secrets, no
+# container-registry, Homebrew or PyPI publication.
+on:
+  push:
+    tags:
+      - 'v*-clickbench.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-portable-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      IMAGE: "quay.io/pypa/manylinux_2_28_x86_64@sha256:0536c364004fa2a3c5041120b6fe35d84fc5bfe31f04c6a6304f13eac4a67b63"
+      ZIP: gizmosql_cli_linux_amd64.zip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build inside the pinned manylinux_2_28 container (glibc 2.28 baseline)
+        run: |
+          docker pull "$IMAGE"
+          docker run --rm \
+            -v "$PWD":"$PWD" \
+            -e REPO_ROOT="$PWD" \
+            -e CMAKE_BUILD_TYPE=Release \
+            "$IMAGE" \
+            bash "$PWD/scripts/build_portable_linux.sh" stable build-portable
+          sudo chown -R "$(id -u):$(id -g)" build-portable
+
+      - name: Check the glibc/GLIBCXX baseline of the produced binaries
+        run: |
+          set -euo pipefail
+          for bin in build-portable/gizmosql_server build-portable/gizmosql_client; do
+            test -x "$bin"
+            bad=$(objdump -T "$bin" | grep -oE 'GLIBC_2\.[0-9]+(\.[0-9]+)?' | sort -Vu \
+              | awk -FGLIBC_ '$2+0 > 0 {split($2,v,"."); if (v[1] > 2 || (v[1] == 2 && v[2] > 28)) print "GLIBC_" $2}')
+            badxx=$(objdump -T "$bin" | grep -oE 'GLIBCXX_3\.4\.[0-9]+' | sort -Vu | awk -FGLIBCXX_3.4. '$2+0 > 25 {print "GLIBCXX_3.4." $2}')
+            if [ -n "$bad$badxx" ]; then echo "$bin exceeds the glibc 2.28 baseline: $bad $badxx"; exit 1; fi
+            echo "OK: $bin is glibc 2.28 baseline clean"
+          done
+          build-portable/gizmosql_server --version
+          build-portable/gizmosql_server --print-duckdb-version || true
+
+      - name: Package and checksum
+        run: |
+          set -euo pipefail
+          cd build-portable
+          zip -j "../$ZIP" gizmosql_server gizmosql_client
+          cd ..
+          sha256sum "$ZIP" build-portable/gizmosql_server build-portable/gizmosql_client > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the GitHub release and attach the assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          gh release create "$tag" --title "$tag" --notes "Portable Linux amd64 build of $tag (glibc 2.28 baseline). See CLICKBENCH-FORK.md." "$ZIP" SHA256SUMS
