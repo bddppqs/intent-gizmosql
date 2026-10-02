@@ -9,6 +9,7 @@
 #include <boost/algorithm/string.hpp>
 
 #include "duckdb_server.h"
+#include "tuning_defaults.h"
 #include "session_context.h"
 #include "gizmosql_logging.h"
 #include "instrumentation/instrumentation_manager.h"
@@ -17,16 +18,48 @@
 
 namespace gizmosql::enterprise {
 
+namespace {
+
+// The pattern below matches only a text whose first byte after the whitespace
+// boost::algorithm::trim strips is K or k, so any other text returns false before the
+// copy, the trim and the regex; the regex is built once (kStatementTextFastPaths; off, the
+// per-call body).
+bool KillPrecheckEnabled() {
+  return gizmosql::kStatementTextFastPaths;
+}
+
+bool MayStartWithKill(const std::string& sql) {
+  size_t i = 0;
+  while (i < sql.size() && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n' ||
+                            sql[i] == '\v' || sql[i] == '\f' || sql[i] == '\r')) {
+    ++i;
+  }
+  return i < sql.size() && (sql[i] == 'K' || sql[i] == 'k');
+}
+
+constexpr const char* kKillPattern =
+    R"(^\s*KILL\s+SESSION\s+['\"]?([0-9a-fA-F-]+)['\"]?\s*;?\s*$)";
+
+}  // namespace
+
 bool IsKillSessionCommand(const std::string& sql, std::string& target_session_id) {
+  const bool fast = KillPrecheckEnabled();
+  if (fast && !MayStartWithKill(sql)) return false;
   std::string trimmed = sql;
   boost::algorithm::trim(trimmed);
   if (trimmed.empty()) return false;
 
   // Match: KILL SESSION 'uuid' or KILL SESSION "uuid" or KILL SESSION uuid
-  std::regex kill_pattern(R"(^\s*KILL\s+SESSION\s+['\"]?([0-9a-fA-F-]+)['\"]?\s*;?\s*$)",
-                          std::regex_constants::icase);
   std::smatch match;
-  if (std::regex_match(trimmed, match, kill_pattern)) {
+  bool matched;
+  if (fast) {
+    static const std::regex kill_pattern(kKillPattern, std::regex_constants::icase);
+    matched = std::regex_match(trimmed, match, kill_pattern);
+  } else {
+    std::regex kill_pattern(kKillPattern, std::regex_constants::icase);
+    matched = std::regex_match(trimmed, match, kill_pattern);
+  }
+  if (matched) {
     target_session_id = match[1].str();
     return true;
   }

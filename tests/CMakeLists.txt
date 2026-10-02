@@ -48,6 +48,7 @@ set(GIZMOSQL_CORE_TEST_SRCS
         integration/test_system_catalog.cpp
         integration/test_read_only_mode.cpp
         integration/test_storage_version.cpp
+        integration/test_statement_ticket_reuse.cpp
         integration/test_token_authorized_emails.cpp
         integration/test_tpch_benchmark.cpp
         integration/test_ducklake.cpp

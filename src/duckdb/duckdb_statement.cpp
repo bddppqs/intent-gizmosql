@@ -29,13 +29,70 @@
 #include <duckdb/parser/statement/set_statement.hpp>
 #include <duckdb/common/enums/set_scope.hpp>
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include <duckdb/catalog/catalog.hpp>
+#include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
+#include <duckdb/catalog/catalog_search_path.hpp>
+#include <duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp>
+#include <duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp>
+#include <duckdb/execution/operator/aggregate/run_aggregate.hpp>
+#include <duckdb/execution/physical_operator.hpp>
+#include <duckdb/execution/physical_plan_generator.hpp>
+#include <duckdb/main/client_data.hpp>
+#include <duckdb/main/config.hpp>
+#include <duckdb/planner/expression/bound_aggregate_expression.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/filter/conjunction_filter.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
+#include <duckdb/planner/filter/optional_filter.hpp>
+#include <duckdb/planner/logical_operator_visitor.hpp>
+#include <duckdb/planner/table_filter.hpp>
+#include <duckdb/execution/operator/aggregate/physical_partitioned_aggregate.hpp>
+#include <duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp>
+#include <duckdb/execution/operator/aggregate/physical_streaming_first_keys.hpp>
+#include <duckdb/execution/operator/filter/physical_filter.hpp>
+#include <duckdb/execution/operator/helper/physical_limit.hpp>
+#include <duckdb/execution/operator/helper/physical_limit_percent.hpp>
+#include <duckdb/execution/operator/helper/physical_streaming_limit.hpp>
+#include <duckdb/execution/operator/join/physical_comparison_join.hpp>
+#include <duckdb/execution/operator/join/physical_iejoin.hpp>
+#include <duckdb/execution/operator/join/physical_nested_loop_join.hpp>
+#include <duckdb/execution/operator/join/physical_piecewise_merge_join.hpp>
+#include <duckdb/execution/operator/order/physical_order.hpp>
+#include <duckdb/execution/operator/order/physical_top_n.hpp>
+#include <duckdb/execution/operator/projection/physical_projection.hpp>
+#include <duckdb/execution/operator/scan/physical_table_scan.hpp>
+#include <duckdb/function/table/table_scan.hpp>
+#include <duckdb/storage/compression/dict_global/column_dictionary.hpp>
+#include <openssl/evp.h>
 #include <future>
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <list>
+#include <mutex>
 #include <optional>
 #include <regex>
 #include <functional>
+#include <mutex>
 #include <unordered_map>
+#include <unordered_set>
+#include <condition_variable>
+#include <deque>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <mutex>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+#include <malloc.h>
+#include <pthread.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <boost/algorithm/string.hpp>
 
@@ -49,6 +106,7 @@
 #include "session_context.h"
 #include "shutdown_state.h"
 #include "admin_command_guard.h"
+#include "tuning_defaults.h"
 #include "gizmosql_telemetry.h"
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_generators.hpp>
@@ -334,6 +392,44 @@ bool ShouldAddAlias(const std::string& sql, size_t func_start, size_t func_end) 
   return false;
 }
 
+// Statement handles and execution ids come from one random_generator per thread
+// instead of one constructed, and seeded from the OS, per call; the text is the same random
+// v4 UUID (kThreadLocalUuid; off, one generator per call).
+bool ThreadLocalUuidEnabled() {
+  return gizmosql::kThreadLocalUuid;
+}
+
+std::string NewUuid() {
+  if (!ThreadLocalUuidEnabled()) {
+    return boost::uuids::to_string(boost::uuids::random_generator()());
+  }
+  thread_local boost::uuids::random_generator generator;
+  return boost::uuids::to_string(generator());
+}
+
+// Every token ReplaceGizmoSQLFunctions replaces begins with GIZMOSQL_, its
+// comparisons run under the classic locale (whose toupper maps a-z alone), and outside a
+// match it copies every byte, so a text without that prefix (ASCII case-insensitive,
+// quoted or not) comes back unchanged (kStatementTextFastPaths; off, the loop always runs).
+bool ReplaceFastPathEnabled() {
+  return gizmosql::kStatementTextFastPaths;
+}
+
+bool ContainsGizmoSQLPrefix(const std::string& sql) {
+  static constexpr char kPrefix[] = "gizmosql_";
+  constexpr size_t kLen = sizeof(kPrefix) - 1;
+  for (size_t i = 0; i + kLen <= sql.size(); ++i) {
+    size_t j = 0;
+    while (j + 1 < kLen && (sql[i + j] | 0x20) == kPrefix[j]) {
+      ++j;
+    }
+    if (j + 1 == kLen && sql[i + j] == '_') {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::string ReplaceGizmoSQLFunctions(const std::string& sql,
                                      const std::string& session_id,
                                      const std::string& instance_id,
@@ -344,6 +440,9 @@ std::string ReplaceGizmoSQLFunctions(const std::string& sql,
                                      bool instrumentation_enabled,
                                      const std::string& instrumentation_catalog,
                                      const std::string& instrumentation_schema) {
+  if (ReplaceFastPathEnabled() && !ContainsGizmoSQLPrefix(sql)) {
+    return sql;
+  }
   std::string result;
   result.reserve(sql.size() * 2);  // Extra space for potential aliases
 
@@ -570,6 +669,182 @@ std::string ReplaceGizmoSQLFunctions(const std::string& sql,
 
 }  // namespace
 
+// The vendored jemalloc's mallctl, a C symbol of the DuckDB library this server links
+// (jemalloc/jemalloc.h is not on this target's include path).
+extern "C" int duckdb_je_mallctl(const char* name, void* oldp, size_t* oldlenp, void* newp,
+                                 size_t newlen);
+
+namespace {
+
+// Statements run on a persistent executor thread instead of a fresh std::async
+// thread. A statement thread that exits is its jemalloc arena's last thread, and
+// jemalloc's tcache_destroy then purges that arena whatever dirty_decay_ms says, so the
+// next statement's thread starts on a cold arena. The executor's threads never exit
+// while they are kept, so their arenas keep their pages between back-to-back statements
+// as DuckDB's own workers do, and release them on the workers' idle clock.
+//
+// kStatementExecutorPool; off, std::async as before (no executor is created).
+bool ExecPoolEnabled() {
+  return gizmosql::kStatementExecutorPool;
+}
+
+// TaskScheduler::ExecuteForever's idle flush for a thread idle 0.5 s, in its
+// allocator_background_threads=false form, through mallctl: past DuckDB's default
+// allocator_flush_threshold (128 MiB) of peak, flush the tcache, purge this thread's
+// arena and reset the peak; then trim the system heap.
+void ExecIdleFlush() {
+  constexpr uint64_t kFlushThreshold = 134217728ULL;
+  uint64_t peak = 0;
+  size_t peak_len = sizeof(peak);
+  if (duckdb_je_mallctl("thread.peak.read", &peak, &peak_len, nullptr, 0) == 0 &&
+      peak > kFlushThreshold) {
+    duckdb_je_mallctl("thread.tcache.flush", nullptr, nullptr, nullptr, 0);
+    unsigned arena = 0;
+    size_t arena_len = sizeof(arena);
+    if (duckdb_je_mallctl("thread.arena", &arena, &arena_len, nullptr, 0) == 0) {
+      char purge[48];
+      std::snprintf(purge, sizeof(purge), "arena.%u.purge", arena);
+      duckdb_je_mallctl(purge, nullptr, nullptr, nullptr, 0);
+    }
+    duckdb_je_mallctl("thread.peak.reset", nullptr, nullptr, nullptr, 0);
+  }
+  malloc_trim(0);
+}
+
+// Allocator::ThreadIdle, for a thread idle for DuckDB's decay delay.
+void ExecThreadIdle() {
+  duckdb_je_mallctl("thread.idle", nullptr, nullptr, nullptr, 0);
+  duckdb_je_mallctl("thread.peak.reset", nullptr, nullptr, nullptr, 0);
+}
+
+// A process-wide executor for DuckDBStatement::Execute's statement lambda. Submit hands
+// the task to the most recently idle thread, or spawns one when none is idle: there is
+// no bound on threads (std::async had none), so concurrent statements never queue
+// behind each other. A thread runs its task, destroys it (and with it the captured
+// session), returns to the idle stack and waits; idle 0.5 s it runs the idle flush, and
+// an idle thread beyond kKeepIdleMax then exits; idle DuckDB's decay delay (1 s) more it
+// marks itself idle to jemalloc and waits untimed.
+class StatementExecutor {
+ public:
+  using Task = std::packaged_task<arrow::Result<int>()>;
+
+  // Created on first use and never destroyed: its threads live as long as the process.
+  static StatementExecutor& Instance() {
+    static StatementExecutor* const instance = new StatementExecutor();
+    return *instance;
+  }
+
+  template <typename F>
+  std::future<arrow::Result<int>> Submit(F&& fn) {
+    Task task(std::forward<F>(fn));
+    auto future = task.get_future();
+    std::shared_ptr<Worker> worker;
+    bool spawn = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (idle_.empty()) {
+        worker = std::make_shared<Worker>();
+        ++spawned_;
+        spawn = true;
+      } else {
+        worker = std::move(idle_.back());
+        idle_.pop_back();
+      }
+      worker->task = std::move(task);
+      worker->stmt = ++submitted_;
+      worker->has_task = true;
+    }
+    if (spawn) {
+      std::thread(&StatementExecutor::Run, this, worker).detach();
+    } else {
+      worker->cv.notify_one();
+    }
+    return future;
+  }
+
+ private:
+  struct Worker {
+    std::condition_variable cv;
+    Task task;
+    uint64_t stmt = 0;
+    bool has_task = false;
+  };
+
+  static constexpr size_t kKeepIdleMax = 16;
+  static constexpr auto kIdleFlushWait = std::chrono::milliseconds(500);
+  static constexpr auto kDecayDelay = std::chrono::seconds(1);
+
+  StatementExecutor() = default;
+
+  void Run(std::shared_ptr<Worker> self) {
+    const auto has_task = [&self] { return self->has_task; };
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (true) {
+      {
+        Task task = std::move(self->task);
+        self->has_task = false;
+        lock.unlock();
+        task();
+      }  // the finished task is destroyed before this thread idles
+      lock.lock();
+      idle_.push_back(self);
+      if (self->cv.wait_for(lock, kIdleFlushWait, has_task)) {
+        continue;
+      }
+      lock.unlock();
+      ExecIdleFlush();
+      lock.lock();
+      ++flushes_;
+      if (!self->has_task && idle_.size() > kKeepIdleMax) {
+        for (auto it = idle_.begin(); it != idle_.end(); ++it) {
+          if (*it == self) {
+            idle_.erase(it);
+            break;
+          }
+        }
+        return;
+      }
+      if (self->cv.wait_for(lock, kDecayDelay, has_task)) {
+        continue;
+      }
+      lock.unlock();
+      ExecThreadIdle();
+      lock.lock();
+      self->cv.wait(lock, has_task);
+    }
+  }
+
+  std::mutex mutex_;
+  std::vector<std::shared_ptr<Worker>> idle_;  // the idle stack, most recently idle last
+  uint64_t submitted_ = 0;
+  uint64_t spawned_ = 0;
+  uint64_t flushes_ = 0;
+  long first_tid_ = 0;
+};
+
+// the executor, or std::async when the executor is off
+template <typename F>
+std::future<arrow::Result<int>> LaunchStatement(std::launch policy, F&& fn) {
+  if (!ExecPoolEnabled()) {
+    return std::async(policy, std::forward<F>(fn));
+  }
+  return StatementExecutor::Instance().Submit(std::forward<F>(fn));
+}
+
+// std::async's future waits for its task in its destructor and a packaged_task's does
+// not: with the executor enabled, wait for the task if Execute unwinds before its own
+// waits, so the statement never runs past Execute's return.
+struct WaitOnUnwind {
+  std::future<arrow::Result<int>>& future;
+  ~WaitOnUnwind() {
+    if (ExecPoolEnabled() && future.valid()) {
+      future.wait();
+    }
+  }
+};
+
+}  // namespace
+
 namespace gizmosql::ddb {
 
 // Resolve whether a catalog with the given name is attached.
@@ -597,6 +872,1097 @@ bool CatalogExistsOnConnection(duckdb::Connection& connection,
 
   auto row = result->Fetch();
   return row != nullptr && row->size() > 0;
+}
+
+// A process-wide, bounded, leased cache of DuckDB PreparedStatementData, consulted
+// by the DoGetStatement and GetFlightInfoStatement Creates of client sessions and
+// keyed by the statement bytes after GizmoSQL's rewrites and the planning
+// environment. Only a statement passing four tiers is cacheable: the raw-text
+// denylist, the statement test, the narrowing tests and the operator allowlist walked
+// over the prepared statement's own physical plan; every execution of any other statement, on
+// every entry point, is bracketed by a pair of generation bumps (the in-flight
+// count between them hides every entry). With kPlanCache off the path is unchanged: no
+// store and no generation counter. The key carries the engine's dictionary
+// publication version (kPlanCacheDictionaryVersion).
+bool PlanCacheEnabled();
+void PlanCachePairBegin();
+void PlanCachePairEnd();
+void PlanCacheFlagSession(const std::string& session_id);
+
+namespace {
+
+constexpr size_t kPlanCacheEntries = 256;
+
+// The engine types a group key as a dictionary code only on a dictionary published when the plan
+// is made (PlanCodeKeys), so the key carries dict_global::PublicationVersion(),
+// read before the lookup and the miss's Prepare: a plan made before a publish (the
+// first execution builds the dictionary) is never served after it, and a plan
+// that typed a dictionary never once that dictionary stops being published.
+bool PlanCacheDictVersionEnabled() {
+  return gizmosql::kPlanCacheDictionaryVersion;
+}
+
+// Tier 0's raw-text denylist and the walker's function-name denylist: `x*` a prefix,
+// else a whole word; identifier characters end a token on both sides; case-insensitive.
+// It stays beside the stability test: a call folded at optimization, replaced at bind by
+// session state or nested in a lambda body never reaches the walker as a function; and
+// one-argument age() is declared CONSISTENT but reads the transaction's date.
+constexpr const char* kPlanCacheDenylist[] = {
+    "current_*",        "getvariable",   "setseed",       "random",
+    "uuid*",            "gen_random_uuid", "nextval",     "currval",
+    "now",              "today",         "transaction_timestamp", "localtime*",
+    "get_current_time*", "txid_current", "in_search_path", "list_sort",
+    "list_reverse_sort", "array_sort",   "array_reverse_sort", "list_grade_up",
+    "write_log",        "constant_or_null", "pg_*",       "version",
+    "age"};
+
+bool IsIdentifierChar(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+         c == '_';
+}
+
+bool DenylistedWord(std::string_view word) {
+  std::string lower(word);
+  for (auto& c : lower) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  for (std::string_view entry : kPlanCacheDenylist) {
+    if (entry.back() == '*') {
+      if (lower.compare(0, entry.size() - 1, entry.substr(0, entry.size() - 1)) == 0 &&
+          lower.size() >= entry.size() - 1) {
+        return true;
+      }
+    } else if (lower == entry) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Tier 0: any whole-word denylist token anywhere in the text, literals included.
+bool TextDenylisted(const std::string& sql) {
+  size_t i = 0;
+  while (i < sql.size()) {
+    if (!IsIdentifierChar(sql[i])) {
+      ++i;
+      continue;
+    }
+    size_t j = i;
+    while (j < sql.size() && IsIdentifierChar(sql[j])) ++j;
+    if (DenylistedWord(std::string_view(sql).substr(i, j - i))) return true;
+    i = j;
+  }
+  return false;
+}
+
+std::string Sha256Hex(const std::string& text) {
+  unsigned char md[EVP_MAX_MD_SIZE];
+  unsigned int length = 0;
+  if (EVP_Digest(text.data(), text.size(), md, &length, EVP_sha256(), nullptr) != 1) {
+    return std::string(64, '0');
+  }
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(length * 2);
+  for (unsigned int i = 0; i < length; i++) {
+    out += kHex[md[i] >> 4];
+    out += kHex[md[i] & 15];
+  }
+  return out;
+}
+
+struct PlanEntry {
+  const duckdb::DatabaseInstance* db = nullptr;
+  std::string key;
+  duckdb::shared_ptr<duckdb::PreparedStatementData> data;
+  std::string query;  // the text PrepareInternal stored
+  std::string username;
+  std::string role;
+  uint64_t generation = 0;  // the counter read at lookup, before the miss's Prepare
+  bool leased = false;
+  bool linked = false;
+};
+
+struct InstancePlans {
+  std::string primary;  // the primary catalog's name, read from a fresh connection
+  bool primary_known = false;
+  std::list<std::shared_ptr<PlanEntry>> lru;  // front: the most recently used
+  std::unordered_map<std::string, std::list<std::shared_ptr<PlanEntry>>::iterator> map;
+};
+
+struct SessionPlanRecord {
+  bool flagged = false;  // ran a statement failing the statement test since its creation
+  bool snapshot_read = false;
+  std::string snapshot;  // SHA-256 (hex) of the settings snapshot
+};
+
+struct StatementPlanRecord {
+  bool cacheable = false;
+  uint64_t stmt = 0;
+  std::shared_ptr<PlanEntry> lease;
+};
+
+struct PlanCache {
+  std::mutex mutex;
+  uint64_t generation = 0;
+  int64_t inflight = 0;
+  std::unordered_map<const duckdb::DatabaseInstance*, InstancePlans> instances;
+  std::unordered_map<std::string, SessionPlanRecord> sessions;
+  std::unordered_map<const DuckDBStatement*, StatementPlanRecord> statements;
+  std::unordered_map<std::string, bool> server_texts;  // a server-own text -> it pairs
+  std::atomic<uint64_t> next_stmt{0};
+};
+
+// Never destroyed, as it may be used until exit.
+PlanCache& GetPlanCache() {
+  static auto* cache = new PlanCache();
+  return *cache;
+}
+
+void UnlinkEntry(InstancePlans& plans, PlanEntry& entry) {
+  if (!entry.linked) return;
+  // cleared before the erase: the list node may hold the entry's last reference
+  entry.linked = false;
+  auto found = plans.map.find(entry.key);
+  if (found != plans.map.end()) {
+    plans.lru.erase(found->second);
+    plans.map.erase(found);
+  }
+}
+
+// The settings snapshot: session-scoped state only (global state - DBConfig, extension defaults, SET
+// GLOBAL, LOAD, INSTALL - moves the generation instead), read by member access: the
+// ClientConfig fields the legacy LOCAL settings and the PRAGMAs write and the SET
+// VARIABLE values, sorted by name. A LOCAL override of a generic option (an extension
+// option's included) sits in ClientConfig::user_settings, whose storage is private in the
+// embedded DuckDB; the session flag is its guard: every SET and RESET is a SET_STATEMENT and
+// every PRAGMA a PRAGMA_STATEMENT, so each fails the statement test and flags the session.
+std::string ReadSettingsSnapshot(duckdb::ClientContext& context) {
+  std::vector<std::pair<std::string, std::string>> rows;
+  const auto& config = context.config;
+  auto field = [&rows](const char* name, int64_t value) {
+    rows.emplace_back(name, std::to_string(value));
+  };
+  field("enable_profiler", config.enable_profiler);
+  field("enable_detailed_profiling", config.enable_detailed_profiling);
+  field("profiler_print_format", static_cast<int64_t>(config.profiler_print_format));
+  rows.emplace_back("profiler_save_location", config.profiler_save_location);
+  std::vector<int64_t> metrics;
+  for (auto metric : config.profiler_settings) metrics.push_back(static_cast<int64_t>(metric));
+  std::sort(metrics.begin(), metrics.end());
+  std::string metric_text;
+  for (auto metric : metrics) metric_text += std::to_string(metric) + ",";
+  rows.emplace_back("profiler_settings", metric_text);
+  field("profiler_settings_type", static_cast<int64_t>(config.profiler_settings_type));
+  field("emit_profiler_output", config.emit_profiler_output);
+  rows.emplace_back("system_progress_bar_disable_reason",
+                    config.system_progress_bar_disable_reason
+                        ? config.system_progress_bar_disable_reason
+                        : "");
+  field("enable_progress_bar", config.enable_progress_bar);
+  field("print_progress_bar", config.print_progress_bar);
+  field("wait_time", config.wait_time);
+  field("query_verification_enabled", config.query_verification_enabled);
+  field("verify_external", config.verify_external);
+  field("verify_fetch_row", config.verify_fetch_row);
+  field("verify_serializer", config.verify_serializer);
+  field("enable_optimizer", config.enable_optimizer);
+  field("enable_caching_operators", config.enable_caching_operators);
+  field("verify_parallelism", config.verify_parallelism);
+  field("force_external", config.force_external);
+  field("force_fetch_row", config.force_fetch_row);
+  field("use_replacement_scans", config.use_replacement_scans);
+  field("streaming_buffer_size", static_cast<int64_t>(config.streaming_buffer_size));
+  field("profiling_coverage", static_cast<int64_t>(config.profiling_coverage));
+  field("enable_http_logging", config.enable_http_logging);
+  rows.emplace_back("http_logging_output", config.http_logging_output);
+  for (auto& variable : config.user_variables) {
+    rows.emplace_back("variable:" + variable.first, variable.second.ToString());
+  }
+  std::sort(rows.begin(), rows.end());
+  std::string text;
+  for (auto& row : rows) {
+    text += std::to_string(row.first.size()) + ":" + row.first +
+            std::to_string(row.second.size()) + ":" + row.second;
+  }
+  return Sha256Hex(text);
+}
+
+// The key: the statement bytes, the search path, the user, the role, the
+// catalog access rules and the settings snapshot (the generation is the entry's tag).
+std::string PlanKey(const std::string& sql, duckdb::ClientContext& context,
+                    const ClientSession& session, const std::string& snapshot) {
+  std::string key;
+  auto add = [&key](const std::string& part) {
+    key += std::to_string(part.size());
+    key += ':';
+    key += part;
+  };
+  add(sql);
+  add(duckdb::CatalogSearchEntry::ListToString(
+      duckdb::ClientData::Get(context).catalog_search_path->GetSetPaths()));
+  add(session.username);
+  add(session.role);
+  std::string access;
+  for (const auto& rule : session.catalog_access) {
+    access += rule.catalog;
+    access += '\x1f';
+    access += std::to_string(static_cast<int>(rule.access));
+    access += '\x1e';
+  }
+  add(access);
+  add(snapshot);
+  if (PlanCacheDictVersionEnabled()) {
+    add(std::to_string(duckdb::dict_global::PublicationVersion()));
+  }
+  return key;
+}
+
+// The statement test on a prepared statement: nullptr when it passes, else the failing test.
+const char* StatementTest(const duckdb::PreparedStatement& stmt, bool in_transaction,
+                          const std::string& primary, bool primary_known) {
+  if (!stmt.success || !stmt.data) return "single";
+  if (stmt.data->statement_type != duckdb::StatementType::SELECT_STATEMENT) return "type";
+  if (!stmt.data->properties.IsReadOnly()) return "writes";
+  for (const auto& database : stmt.data->properties.read_databases) {
+    if (!primary_known || database.first != primary) return "database";
+  }
+  if (in_transaction) return "transaction";
+  return nullptr;
+}
+
+// The operator allowlist, walked over the prepared statement's own physical plan - the artifact the cache
+// serves - with the logical allowlist mapped onto the physical operators the plan
+// generator makes of each allowed logical operator: every
+// operator, every operator-owned expression and every table filter; anything unmapped
+// fails closed. The class is a LogicalOperatorVisitor only for its expression recursion.
+class AllowlistWalker : public duckdb::LogicalOperatorVisitor {
+ public:
+  enum Test : unsigned {
+    kOperator = 1,
+    kTable = 2,
+    kFilter = 4,
+    kExpression = 8,
+    kFunction = 16,
+    kAggregate = 32,
+    kPlan = 64
+  };
+
+  explicit AllowlistWalker(const std::string& primary) : primary_(primary) {}
+
+  unsigned failed = 0;
+
+  void VisitExpression(duckdb::unique_ptr<duckdb::Expression>* expression) override {
+    if (expression == nullptr || !*expression) {
+      failed |= kPlan;
+      return;
+    }
+    auto& expr = **expression;
+    switch (expr.GetExpressionClass()) {
+      case duckdb::ExpressionClass::BOUND_COLUMN_REF:
+      case duckdb::ExpressionClass::BOUND_REF:
+      case duckdb::ExpressionClass::BOUND_CONSTANT:
+      case duckdb::ExpressionClass::BOUND_COMPARISON:
+      case duckdb::ExpressionClass::BOUND_CONJUNCTION:
+      case duckdb::ExpressionClass::BOUND_OPERATOR:
+      case duckdb::ExpressionClass::BOUND_CAST:
+      case duckdb::ExpressionClass::BOUND_BETWEEN:
+      case duckdb::ExpressionClass::BOUND_CASE:
+        break;
+      case duckdb::ExpressionClass::BOUND_FUNCTION: {
+        auto& function = static_cast<duckdb::BoundFunctionExpression&>(expr).function;
+        CheckFunction(function.name, function.GetStability());
+        break;
+      }
+      case duckdb::ExpressionClass::BOUND_AGGREGATE: {
+        auto& aggregate = static_cast<duckdb::BoundAggregateExpression&>(expr);
+        CheckFunction(aggregate.function.name, aggregate.function.GetStability());
+        // physical planning replaces an ordered aggregate by a same-named wrapper whose
+        // bind data (it keeps a ClientContext &) its own bind callback did not make
+        if (aggregate.order_bys || aggregate.filter ||
+            (aggregate.bind_info && !aggregate.function.bind)) {
+          failed |= kAggregate;
+        }
+        break;
+      }
+      default:
+        failed |= kExpression;
+        return;
+    }
+    VisitExpressionChildren(expr);
+  }
+
+  void Walk(duckdb::PhysicalOperator& root) {
+    std::vector<duckdb::PhysicalOperator*> stack{&root};
+    std::unordered_set<duckdb::PhysicalOperator*> seen;
+    while (!stack.empty()) {
+      auto* op = stack.back();
+      stack.pop_back();
+      if (!seen.insert(op).second) continue;
+      VisitPhysical(*op);
+      for (auto& child : op->GetChildren()) {
+        stack.push_back(&const_cast<duckdb::PhysicalOperator&>(child.get()));
+      }
+    }
+  }
+
+ private:
+  // a bound scalar or aggregate function: DuckDB declares it CONSISTENT, no denylist word
+  void CheckFunction(const std::string& name, duckdb::FunctionStability stability) {
+    if (stability != duckdb::FunctionStability::CONSISTENT || DenylistedWord(name)) {
+      failed |= kFunction;
+    }
+  }
+
+  void Visit(duckdb::unique_ptr<duckdb::Expression>& expression) { VisitExpression(&expression); }
+
+  void Visit(duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& expressions) {
+    for (auto& expression : expressions) Visit(expression);
+  }
+
+  void Visit(duckdb::vector<duckdb::BoundOrderByNode>& orders) {
+    for (auto& order : orders) Visit(order.expression);
+  }
+
+  void Visit(duckdb::BoundLimitNode& limit) {
+    if (limit.GetExpression()) Visit(limit.GetExpression());
+  }
+
+  void VisitConditions(duckdb::PhysicalComparisonJoin& join) {
+    for (auto& condition : join.conditions) {
+      Visit(condition.left);
+      Visit(condition.right);
+    }
+  }
+
+  void VisitPhysical(duckdb::PhysicalOperator& op) {
+    using T = duckdb::PhysicalOperatorType;
+    switch (op.type) {
+      case T::TABLE_SCAN:  // LOGICAL_GET
+        VisitScan(static_cast<duckdb::PhysicalTableScan&>(op));
+        return;
+      case T::FILTER:  // LOGICAL_FILTER (and a LOGICAL_GET's remaining filter)
+        Visit(static_cast<duckdb::PhysicalFilter&>(op).expression);
+        return;
+      case T::PROJECTION:  // LOGICAL_PROJECTION (and the generator's own projections)
+        Visit(static_cast<duckdb::PhysicalProjection&>(op).select_list);
+        return;
+      case T::UNGROUPED_AGGREGATE:
+        Visit(static_cast<duckdb::PhysicalUngroupedAggregate&>(op).aggregates);
+        return;
+      case T::HASH_GROUP_BY: {
+        auto& data = static_cast<duckdb::PhysicalHashAggregate&>(op).grouped_aggregate_data;
+        Visit(data.groups);
+        Visit(data.aggregates);
+        return;
+      }
+      case T::PERFECT_HASH_GROUP_BY: {  // LOGICAL_AGGREGATE_AND_GROUP_BY
+        auto& aggregate = static_cast<duckdb::PhysicalPerfectHashAggregate&>(op);
+        Visit(aggregate.groups);
+        Visit(aggregate.aggregates);
+        return;
+      }
+      case T::PARTITIONED_AGGREGATE: {  // LOGICAL_AGGREGATE_AND_GROUP_BY
+        auto& aggregate = static_cast<duckdb::PhysicalPartitionedAggregate&>(op);
+        Visit(aggregate.groups);
+        Visit(aggregate.aggregates);
+        return;
+      }
+      case T::STREAMING_FIRST_KEYS:
+        Visit(static_cast<duckdb::PhysicalStreamingFirstKeys&>(op).groups);
+        return;
+      case T::ORDER_BY:  // LOGICAL_ORDER_BY
+        Visit(static_cast<duckdb::PhysicalOrder&>(op).orders);
+        return;
+      case T::TOP_N:  // LOGICAL_TOP_N
+        Visit(static_cast<duckdb::PhysicalTopN&>(op).orders);
+        return;
+      case T::LIMIT: {  // LOGICAL_LIMIT
+        auto& limit = static_cast<duckdb::PhysicalLimit&>(op);
+        Visit(limit.limit_val);
+        Visit(limit.offset_val);
+        return;
+      }
+      case T::STREAMING_LIMIT: {  // LOGICAL_LIMIT
+        auto& limit = static_cast<duckdb::PhysicalStreamingLimit&>(op);
+        Visit(limit.limit_val);
+        Visit(limit.offset_val);
+        return;
+      }
+      case T::LIMIT_PERCENT: {  // LOGICAL_LIMIT
+        auto& limit = static_cast<duckdb::PhysicalLimitPercent&>(op);
+        Visit(limit.limit_val);
+        Visit(limit.offset_val);
+        return;
+      }
+      case T::HASH_JOIN:  // LOGICAL_COMPARISON_JOIN
+        VisitConditions(static_cast<duckdb::PhysicalComparisonJoin&>(op));
+        return;
+      case T::NESTED_LOOP_JOIN: {  // LOGICAL_COMPARISON_JOIN
+        auto& join = static_cast<duckdb::PhysicalNestedLoopJoin&>(op);
+        VisitConditions(join);
+        if (join.predicate) Visit(join.predicate);
+        return;
+      }
+      case T::PIECEWISE_MERGE_JOIN: {  // LOGICAL_COMPARISON_JOIN
+        auto& join = static_cast<duckdb::PhysicalPiecewiseMergeJoin&>(op);
+        VisitConditions(join);
+        Visit(join.lhs_orders);
+        Visit(join.rhs_orders);
+        return;
+      }
+      case T::IE_JOIN: {  // LOGICAL_COMPARISON_JOIN
+        auto& join = static_cast<duckdb::PhysicalIEJoin&>(op);
+        VisitConditions(join);
+        Visit(join.lhs_orders);
+        Visit(join.rhs_orders);
+        return;
+      }
+      default:  // unmapped: BLOCKWISE_NL_JOIN, CROSS_PRODUCT, INOUT_FUNCTION and every other
+        failed |= kOperator;
+        return;
+    }
+  }
+
+  // seq_scan over a non-temporary table of the primary catalog, the catalog neither
+  // system nor temporary, with table filters of the listed kinds
+  void VisitScan(duckdb::PhysicalTableScan& scan) {
+    bool table_ok = scan.function.name == "seq_scan" && scan.bind_data != nullptr;
+    if (table_ok) {
+      auto& table = static_cast<duckdb::TableScanBindData&>(*scan.bind_data).table;
+      auto& catalog = table.ParentCatalog();
+      table_ok = !table.temporary && catalog.GetName() == primary_ &&
+                 !catalog.IsSystemCatalog() && !catalog.IsTemporaryCatalog();
+    }
+    if (!table_ok) failed |= kTable;
+    if (scan.table_filters) {
+      for (auto& entry : scan.table_filters->filters) {
+        VisitFilter(entry.second.get());
+      }
+    }
+  }
+
+  void VisitFilter(duckdb::TableFilter* filter) {
+    if (filter == nullptr) {
+      failed |= kPlan;
+      return;
+    }
+    switch (filter->filter_type) {
+      case duckdb::TableFilterType::CONSTANT_COMPARISON:
+      case duckdb::TableFilterType::IS_NULL:
+      case duckdb::TableFilterType::IS_NOT_NULL:
+      case duckdb::TableFilterType::IN_FILTER:
+      case duckdb::TableFilterType::DYNAMIC_FILTER:
+        return;
+      case duckdb::TableFilterType::CONJUNCTION_AND:
+      case duckdb::TableFilterType::CONJUNCTION_OR:
+        for (auto& child : static_cast<duckdb::ConjunctionFilter*>(filter)->child_filters) {
+          VisitFilter(child.get());
+        }
+        return;
+      case duckdb::TableFilterType::OPTIONAL_FILTER:
+        VisitFilter(static_cast<duckdb::OptionalFilter*>(filter)->child_filter.get());
+        return;
+      case duckdb::TableFilterType::EXPRESSION_FILTER:
+        VisitExpression(&static_cast<duckdb::ExpressionFilter*>(filter)->expr);
+        return;
+      default:
+        failed |= kFilter;
+        return;
+    }
+  }
+
+  const std::string& primary_;
+};
+
+// The allowlist on the miss path, over the prepared plan: nullptr when it passes, else the first
+// failing test (the operators over the whole plan before the scans); any exception
+// is `plan`.
+const char* AllowlistTest(duckdb::PreparedStatementData& data, const std::string& primary) {
+  try {
+    if (!data.physical_plan) return "plan";
+    AllowlistWalker walker(primary);
+    walker.Walk(data.physical_plan->Root());
+    static constexpr std::pair<unsigned, const char*> kOrder[] = {
+        {AllowlistWalker::kOperator, "operator"},     {AllowlistWalker::kTable, "table"},
+        {AllowlistWalker::kFilter, "filter"},         {AllowlistWalker::kExpression, "expression"},
+        {AllowlistWalker::kFunction, "function"},     {AllowlistWalker::kAggregate, "aggregate"},
+        {AllowlistWalker::kPlan, "plan"}};
+    for (const auto& [bit, name] : kOrder) {
+      if (walker.failed & bit) return name;
+    }
+    return nullptr;
+  } catch (...) {
+    return "plan";
+  }
+}
+
+// Async teardown. The lease return below clears a leased plan's operator states on the
+// thread that destroys the statement: the Flight DoGet handler, inside
+// ~RecordBatchStream, before gRPC sends the stream's final status. Enabled
+// (kAsyncTeardown), the clear moves each HASH_GROUP_BY operator's sink state out of the
+// plan instead of destroying it, releases the lease as before (so the next statement can
+// take the plan at once), and hands the states to one process-wide reaper thread, which
+// destroys them while the handler finishes the RPC, so the result stream no longer waits
+// for the aggregate states to be destroyed. The job keeps the plan entry (the states'
+// operators) and the database instance (their buffer manager and task scheduler) alive
+// until the states are gone; no destructor of these states touches a ClientContext, so
+// the session's connection is free for its next statement meanwhile. At most
+// kMaxPendingReaps jobs wait or run; beyond that the states are destroyed inline as
+// before. DrainTeardownReaper() (server shutdown) waits for every job. Off, no reaper is
+// created and the path is unchanged.
+bool AsyncTeardownEnabled() {
+  return gizmosql::kAsyncTeardown;
+}
+
+using DetachedStates = std::vector<duckdb::unique_ptr<duckdb::GlobalSinkState>>;
+
+class TeardownReaper {
+ public:
+  // Created on first use and never destroyed: its thread lives as long as the process.
+  static TeardownReaper& Instance() {
+    static TeardownReaper* const instance = new TeardownReaper();
+    return *instance;
+  }
+
+  // Takes `states` (with what keeps their referents alive) when fewer than
+  // kMaxPendingReaps jobs wait or run; otherwise, or on any failure, leaves them with
+  // the caller and returns false.
+  bool Submit(DetachedStates& states, const std::shared_ptr<PlanEntry>& entry,
+              duckdb::shared_ptr<duckdb::DatabaseInstance>& db, uint64_t stmt) noexcept {
+    bool taken = false;
+    try {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (pending_ < kMaxPendingReaps) {
+        if (!started_) {
+          std::thread(&TeardownReaper::Run, this).detach();
+          started_ = true;
+        }
+        jobs_.emplace_back();  // nothing is moved before this allocation
+        Job& job = jobs_.back();
+        job.states = std::move(states);
+        job.entry = entry;
+        job.db = std::move(db);
+        job.stmt = stmt;
+        taken = true;
+        ++pending_;
+      }
+    } catch (...) {
+      taken = false;
+    }
+    if (taken) work_.notify_one();
+    return taken;
+  }
+
+  // Waits until no job waits or runs.
+  void Drain() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    idle_.wait(lock, [this] { return pending_ == 0; });
+    lock.unlock();
+  }
+
+ private:
+  struct Job {
+    DetachedStates states;
+    std::shared_ptr<PlanEntry> entry;                  // the plan the states' operators live in
+    duckdb::shared_ptr<duckdb::DatabaseInstance> db;  // their buffer manager and scheduler
+    uint64_t stmt = 0;
+  };
+
+  static constexpr size_t kMaxPendingReaps = 4;
+
+  TeardownReaper() = default;
+
+  void Run() {
+    pthread_setname_np(pthread_self(), "gizmosql_reaper");  // not the spawning handler's name
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (true) {
+      work_.wait(lock, [this] { return !jobs_.empty(); });
+      Job job = std::move(jobs_.front());
+      jobs_.pop_front();
+      lock.unlock();
+      job.states.clear();  // before the entry: the states reference its operators
+      job.entry.reset();
+      job.db.reset();
+      lock.lock();
+      if (--pending_ == 0) idle_.notify_all();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable work_;
+  std::condition_variable idle_;
+  std::deque<Job> jobs_;
+  size_t pending_ = 0;  // jobs waiting or running
+  bool started_ = false;
+};
+
+// The plan's operators walked through GetChildren(), every sink and operator
+// state reset, and the run-aware descriptors released through their own entry points.
+// With `detached` (async teardown), a HASH_GROUP_BY operator's sink state is moved there
+// instead of destroyed.
+void DropPlanState(duckdb::PreparedStatementData& data, DetachedStates* detached = nullptr) {
+  if (!data.physical_plan) return;
+  std::vector<duckdb::PhysicalOperator*> stack{&data.physical_plan->Root()};
+  std::unordered_set<duckdb::PhysicalOperator*> seen;
+  while (!stack.empty()) {
+    auto* op = stack.back();
+    stack.pop_back();
+    if (!seen.insert(op).second) continue;
+    for (auto& child : op->GetChildren()) {
+      stack.push_back(&const_cast<duckdb::PhysicalOperator&>(child.get()));
+    }
+    if (op->type == duckdb::PhysicalOperatorType::HASH_GROUP_BY) {
+      auto& aggregate = static_cast<duckdb::PhysicalHashAggregate&>(*op);
+      if (aggregate.run_aggregate && aggregate.run_aggregate->IsGrouped() && op->sink_state) {
+        aggregate.run_aggregate->ResetGrouped(*op->sink_state);
+      }
+      if (detached && op->sink_state) {
+        detached->push_back(std::move(op->sink_state));
+      }
+    } else if (op->type == duckdb::PhysicalOperatorType::UNGROUPED_AGGREGATE) {
+      auto& aggregate = static_cast<duckdb::PhysicalUngroupedAggregate&>(*op);
+      if (aggregate.run_aggregate && !aggregate.run_aggregate->IsGrouped()) {
+        aggregate.run_aggregate->Reset(duckdb::Allocator::DefaultAllocator());
+      }
+    }
+    op->sink_state.reset();
+    op->op_state.reset();
+  }
+}
+
+// The lease return. Under the mutex, after an acquire fence, the plan's owner count:
+// 1 - no context can still execute it: its state is dropped (still leased, so no
+// statement takes it meanwhile) and the flag cleared; more - a context still owns it:
+// the entry is evicted without the state drop. With `db` (a statement's return, async
+// teardown enabled), the dropped aggregate states go to the reaper before the flag clears.
+void ReturnLease(const std::shared_ptr<PlanEntry>& entry, uint64_t stmt,
+                 duckdb::shared_ptr<duckdb::DatabaseInstance> db = nullptr) {
+  auto& cache = GetPlanCache();
+  long owners = 0;
+  bool drop = false;
+  {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    owners = entry->data.use_count();
+    if (entry->linked && owners == 1) {
+      drop = true;
+    } else {
+      UnlinkEntry(cache.instances[entry->db], *entry);
+      entry->leased = false;
+    }
+  }
+  if (drop) {
+    bool dropped = true;
+    DetachedStates detached;
+    try {
+      DropPlanState(*entry->data, db ? &detached : nullptr);
+    } catch (...) {
+      dropped = false;
+    }
+    if (!detached.empty() &&
+        !(dropped && TeardownReaper::Instance().Submit(detached, entry, db, stmt))) {
+      detached.clear();  // inline, as with kAsyncTeardown false
+    }
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (!dropped) UnlinkEntry(cache.instances[entry->db], *entry);
+    entry->leased = false;
+  }
+}
+
+// A lease Create took, returned if Create exits before the statement holds it.
+struct PlanLease {
+  std::shared_ptr<PlanEntry> entry;
+  uint64_t stmt = 0;
+  duckdb::shared_ptr<duckdb::DatabaseInstance> db;  // set by a statement's return (async teardown)
+  PlanLease() = default;
+  PlanLease(const PlanLease&) = delete;
+  PlanLease& operator=(const PlanLease&) = delete;
+  ~PlanLease() {
+    if (entry) ReturnLease(entry, stmt, std::move(db));
+  }
+};
+
+// The session flag: set on every exit from Create unless the statement passed the
+// statement test.
+class SessionFlagGuard {
+ public:
+  explicit SessionFlagGuard(const std::string& session_id)
+      : enabled_(PlanCacheEnabled()), session_id_(session_id) {}
+  SessionFlagGuard(const SessionFlagGuard&) = delete;
+  SessionFlagGuard& operator=(const SessionFlagGuard&) = delete;
+  ~SessionFlagGuard() {
+    if (enabled_ && !passed_) PlanCacheFlagSession(session_id_);
+  }
+  void Pass() { passed_ = true; }
+
+ private:
+  bool enabled_;
+  bool passed_ = false;
+  std::string session_id_;
+};
+
+// A pre-bump at construction and its one post-bump at destruction.
+class GenerationPair {
+ public:
+  explicit GenerationPair(bool paired = true) : paired_(paired) {
+    if (paired_) PlanCachePairBegin();
+  }
+  GenerationPair(const GenerationPair&) = delete;
+  GenerationPair& operator=(const GenerationPair&) = delete;
+  ~GenerationPair() {
+    if (paired_) PlanCachePairEnd();
+  }
+
+ private:
+  bool paired_;
+};
+
+template <class F>
+auto Paired(F&& f) {
+  GenerationPair pair;
+  return f();
+}
+
+// The verdict Create stores on a statement object, with the lease it hands on.
+void RegisterStatement(const DuckDBStatement* statement, bool cacheable, PlanLease& lease) {
+  auto& cache = GetPlanCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  auto& record = cache.statements[statement];
+  record.cacheable = cacheable;
+  record.stmt = lease.stmt;
+  record.lease = std::move(lease.entry);
+}
+
+bool StatementCacheable(const DuckDBStatement* statement) {
+  auto& cache = GetPlanCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  auto found = cache.statements.find(statement);
+  return found != cache.statements.end() && found->second.cacheable;
+}
+
+// The statement's record erased; its lease, if any, handed to the caller.
+void ForgetStatement(const DuckDBStatement* statement, PlanLease& lease) {
+  auto& cache = GetPlanCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  auto found = cache.statements.find(statement);
+  if (found == cache.statements.end()) return;
+  lease.stmt = found->second.stmt;
+  lease.entry = std::move(found->second.lease);
+  cache.statements.erase(found);
+}
+
+struct PlanOutcome {
+  std::shared_ptr<duckdb::PreparedStatement> stmt;
+  bool cacheable = false;
+  bool passes_e0 = false;
+  uint64_t stmt_number = 0;
+};
+
+// One Create with the cache enabled: the tests in order, the
+// lookup (a consulting Create only), the hit or the plain Prepare, the allowlist on a miss and
+// the insert.
+PlanOutcome LookupOrPrepare(const std::shared_ptr<ClientSession>& session,
+                            const std::string& effective_sql,
+                            const std::string& flight_method, bool is_internal,
+                            bool has_settings_binds, PlanLease& lease) {
+  PlanOutcome out;
+  auto& cache = GetPlanCache();
+  auto& connection = session->connection->Get();
+  auto& context = *connection.context;
+  const duckdb::DatabaseInstance* db = context.db.get();
+  const bool consults = !is_internal && (flight_method == "DoGetStatement" ||
+                                         flight_method == "GetFlightInfoStatement");
+
+  const bool text_denied = TextDenylisted(effective_sql);
+  const bool in_transaction = connection.HasActiveTransaction();
+  bool flagged = false;
+  std::string snapshot;
+  std::string primary;
+  bool primary_known = false;
+  uint64_t gen = 0;
+  int64_t inflight = 0;
+  {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    auto& plans = cache.instances[db];
+    primary = plans.primary;
+    primary_known = plans.primary_known;
+    if (auto it = cache.sessions.find(session->session_id); it != cache.sessions.end()) {
+      flagged = it->second.flagged;
+      if (it->second.snapshot_read) snapshot = it->second.snapshot;
+    }
+    gen = cache.generation;
+    inflight = cache.inflight;
+  }
+
+  // the lookup
+  const char* reason = nullptr;
+  std::string key;
+  std::shared_ptr<PlanEntry> hit;
+  duckdb::shared_ptr<duckdb::PreparedStatementData> hit_data;
+  std::string hit_query;
+  if (consults && !text_denied && !in_transaction && !flagged && !has_settings_binds) {
+    try {
+      if (snapshot.empty()) {
+        snapshot = ReadSettingsSnapshot(context);
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        auto& record = cache.sessions[session->session_id];
+        record.snapshot_read = true;
+        record.snapshot = snapshot;
+      }
+      key = PlanKey(effective_sql, context, *session, snapshot);
+      std::shared_ptr<PlanEntry> candidate;
+      {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        gen = cache.generation;
+        inflight = cache.inflight;
+        auto& plans = cache.instances[db];
+        if (inflight > 0) {
+          reason = "miss-writer-inflight";
+        } else if (auto found = plans.map.find(key); found == plans.map.end()) {
+          reason = "miss-cold";
+        } else if (auto entry = *found->second; entry->leased) {
+          reason = "miss-leased";
+        } else if (entry->generation != gen) {
+          // never served; it stays until an insert of the key replaces it or the
+          // capacity eviction takes it
+          reason = "miss-generation";
+        } else {
+          entry->leased = true;
+          plans.lru.splice(plans.lru.begin(), plans.lru, found->second);
+          candidate = entry;
+          hit_data = entry->data;
+          hit_query = entry->query;
+        }
+      }
+      if (candidate) {
+        // the catalog-identity belt, inside a transaction (Create holds none)
+        bool rebind = true;
+        bool error = false;
+        try {
+          context.RunFunctionInTransaction(
+              [&]() { rebind = hit_data->RequireRebind(context, nullptr); }, false);
+        } catch (...) {
+          error = true;
+        }
+        if (error || rebind) {
+          std::lock_guard<std::mutex> lock(cache.mutex);
+          UnlinkEntry(cache.instances[db], *candidate);
+          candidate->leased = false;
+          hit_data = nullptr;
+          reason = error ? "miss-lookup-error" : "miss-rebind";
+        } else {
+          hit = candidate;
+          reason = "hit";
+        }
+      }
+    } catch (...) {
+      reason = "miss-lookup-error";
+    }
+  }
+
+  if (hit) {
+    out.stmt = std::make_shared<duckdb::PreparedStatement>(
+        connection.context, hit_data, hit_query, duckdb::case_insensitive_map_t<duckdb::idx_t>());
+    lease.entry = hit;
+  } else {
+    out.stmt = connection.Prepare(effective_sql);
+  }
+
+  // the tests in order; the first failure names the reason
+  const char* ineligible = nullptr;
+  bool prepared = true;
+  if (hit) {
+    out.passes_e0 = true;
+  } else {
+    const char* e0 = StatementTest(*out.stmt, in_transaction, primary, primary_known);
+    out.passes_e0 = e0 == nullptr;
+    prepared = !(e0 != nullptr && std::string_view(e0) == "single");
+    if (text_denied) {
+      ineligible = "text";
+    } else if (e0 != nullptr && prepared) {
+      ineligible = e0;
+    } else if (!prepared && in_transaction) {
+      ineligible = "transaction";
+    } else if (flagged) {
+      ineligible = "session";
+    } else if (prepared && (!out.stmt->data->properties.bound_all_parameters ||
+                            out.stmt->data->properties.parameter_count != 0 ||
+                            !out.stmt->data->value_map.empty())) {
+      ineligible = "parameters";
+    } else if (prepared && out.stmt->data->properties.always_require_rebind) {
+      ineligible = "rebind";
+    } else if (has_settings_binds) {
+      ineligible = "settings";
+    }
+  }
+
+  // EA on a miss that could be cacheable, then the insert
+  if (hit) {
+    out.cacheable = true;
+  } else if (consults && prepared && ineligible == nullptr && reason != nullptr &&
+             !key.empty() && std::string_view(reason) != "miss-writer-inflight") {
+    ineligible = AllowlistTest(*out.stmt->data, primary);
+    out.cacheable = ineligible == nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    auto& plans = cache.instances[db];
+    if (out.cacheable && !hit && std::string_view(reason) != "miss-leased") {
+      // no insert while a writer is in flight or once the generation moved
+      if (cache.inflight <= 0 && cache.generation == gen) {
+        if (auto found = plans.map.find(key); found != plans.map.end()) {
+          UnlinkEntry(plans, **found->second);
+        }
+        bool room = plans.map.size() < kPlanCacheEntries;
+        for (auto it = plans.lru.end(); !room && it != plans.lru.begin();) {
+          --it;
+          if (!(*it)->leased) {
+            UnlinkEntry(plans, **it);
+            room = true;
+          }
+        }
+        if (room) {
+          auto entry = std::make_shared<PlanEntry>();
+          entry->db = db;
+          entry->key = key;
+          entry->data = out.stmt->data;
+          entry->query = out.stmt->query;
+          entry->username = session->username;
+          entry->role = session->role;
+          entry->generation = gen;
+          entry->leased = true;
+          entry->linked = true;
+          plans.lru.push_front(entry);
+          plans.map[key] = plans.lru.begin();
+          lease.entry = entry;
+        }
+      }
+    }
+  }
+
+  if (consults) {
+    out.stmt_number = ++cache.next_stmt;
+    lease.stmt = out.stmt_number;
+  }
+  return out;
+}
+
+}  // namespace
+
+bool PlanCacheEnabled() {
+  return gizmosql::kPlanCache;
+}
+
+void PlanCachePairBegin() {
+  if (!PlanCacheEnabled()) return;
+  auto& cache = GetPlanCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  ++cache.generation;
+  ++cache.inflight;
+}
+
+void PlanCachePairEnd() {
+  if (!PlanCacheEnabled()) return;
+  auto& cache = GetPlanCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  ++cache.generation;
+  --cache.inflight;
+}
+
+void PlanCacheSetPrimaryCatalog(const duckdb::DatabaseInstance* db, const std::string& name) {
+  if (!PlanCacheEnabled()) return;
+  auto& cache = GetPlanCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  auto& plans = cache.instances[db];
+  plans.primary = name;
+  plans.primary_known = true;
+}
+
+void PlanCacheFlagSession(const std::string& session_id) {
+  if (!PlanCacheEnabled()) return;
+  auto& cache = GetPlanCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  cache.sessions[session_id].flagged = true;
+}
+
+void PlanCacheForgetSession(const std::string& session_id) {
+  if (!PlanCacheEnabled()) return;
+  auto& cache = GetPlanCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  cache.sessions.erase(session_id);
+}
+
+// Async teardown: returns once no reaper job waits or runs (a no-op with kAsyncTeardown false).
+void DrainTeardownReaper() {
+  if (!AsyncTeardownEnabled()) return;
+  TeardownReaper::Instance().Drain();
+}
+
+// The server's own statements (a fresh connection per call): a text passing the statement test -
+// the health check's SELECT 1 - never pairs; any other pairs. Classified once per
+// text by a Prepare on such a connection.
+bool PlanCacheServerTextPairs(duckdb::Connection& connection, const std::string& sql) {
+  if (!PlanCacheEnabled()) return false;
+  auto& cache = GetPlanCache();
+  const duckdb::DatabaseInstance* db = connection.context->db.get();
+  std::string primary;
+  bool primary_known = false;
+  {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (auto found = cache.server_texts.find(sql); found != cache.server_texts.end()) {
+      return found->second;
+    }
+    auto& plans = cache.instances[db];
+    primary = plans.primary;
+    primary_known = plans.primary_known;
+  }
+  bool pairs = true;
+  try {
+    const bool in_transaction = connection.HasActiveTransaction();
+    auto stmt = connection.Prepare(sql);
+    pairs = !stmt || StatementTest(*stmt, in_transaction, primary, primary_known) != nullptr;
+  } catch (...) {
+    pairs = true;
+  }
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  cache.server_texts[sql] = pairs;
+  return pairs;
+}
+
+namespace {
+// Prepare once: the statement counts of the sessions that have asked for one (a
+// GetFlightInfoStatement with prepare once on); never destroyed, as it may be used until
+// exit.
+struct SessionStatementCounts {
+  std::mutex mutex;
+  std::unordered_map<std::string, uint64_t> counts;
+};
+
+SessionStatementCounts& GetSessionStatementCounts() {
+  static auto* counts = new SessionStatementCounts();
+  return *counts;
+}
+}  // namespace
+
+uint64_t SessionStatementCount(const std::string& session_id) {
+  auto& s = GetSessionStatementCounts();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  return s.counts[session_id];
+}
+
+void CountSessionStatement(const std::string& session_id) {
+  auto& s = GetSessionStatementCounts();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (auto it = s.counts.find(session_id); it != s.counts.end()) {
+    ++it->second;
+  }
+}
+
+void ForgetSessionStatementCount(const std::string& session_id) {
+  auto& s = GetSessionStatementCounts();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  s.counts.erase(session_id);
 }
 
 namespace {
@@ -755,6 +2121,8 @@ arrow::Result<std::shared_ptr<DuckDBStatement>> DuckDBStatement::Create(
     const std::string& sql, const std::optional<arrow::util::ArrowLogLevel>& log_level,
     const bool& log_queries, const std::shared_ptr<arrow::Schema>& override_schema,
     const std::string& flight_method, bool is_internal) {
+  // the plan cache's session flag, set on every path unless the statement passes the statement test
+  SessionFlagGuard plan_flag_guard(client_session->session_id);
   std::string status;
   auto logged_sql = redact_sql_for_logs(sql);
   // Threshold: session/server log level gates whether messages are emitted
@@ -861,7 +2229,10 @@ arrow::Result<std::shared_ptr<DuckDBStatement>> DuckDBStatement::Create(
 
   if (!is_internal) {
     if (auto use_catalog_name = TryExtractUseCatalogName(sql)) {
-      if (CatalogExistsOnConnection(client_session->connection->Get(), *use_catalog_name)) {
+      if (Paired([&] {
+            return CatalogExistsOnConnection(client_session->connection->Get(),
+                                             *use_catalog_name);
+          })) {
         ARROW_RETURN_NOT_OK(gizmosql::enterprise::EnsureCatalogReadAccess(
             client_session, *use_catalog_name, instr_mgr, handle, logged_sql,
             flight_method, is_internal, log_catalog));
@@ -872,8 +2243,11 @@ arrow::Result<std::shared_ptr<DuckDBStatement>> DuckDBStatement::Create(
   // Catalog visibility filtering: rewrite metadata queries to hide unauthorized catalogs
   if (!client_session->catalog_access.empty() &&
       enterprise::EnterpriseFeatures::Instance().IsCatalogPermissionsAvailable()) {
-    auto allowed = enterprise::GetAllowedCatalogs(
-        *client_session, client_session->connection->Get(), instr_mgr, log_catalog);
+    auto allowed = Paired([&] {
+      return enterprise::GetAllowedCatalogs(*client_session,
+                                            client_session->connection->Get(), instr_mgr,
+                                            log_catalog);
+    });
     if (!allowed.empty()) {
       auto filter_in = enterprise::BuildCatalogFilterIN(allowed);
       std::string rewritten;
@@ -1026,8 +2400,20 @@ arrow::Result<std::shared_ptr<DuckDBStatement>> DuckDBStatement::Create(
     return result;
   }
 
-  std::shared_ptr<duckdb::PreparedStatement> stmt =
-      client_session->connection->Get().Prepare(effective_sql);
+  // The plan cache's lookup-or-Prepare; with the cache off, the plain Prepare. A lease taken here returns if Create exits before the
+  // statement holds it (declared before `stmt`, so the plan's holder is released first).
+  PlanLease plan_lease;
+  bool plan_cacheable = false;
+  std::shared_ptr<duckdb::PreparedStatement> stmt;
+  if (PlanCacheEnabled()) {
+    auto outcome = LookupOrPrepare(client_session, effective_sql, flight_method, is_internal,
+                                   !settings_binds.empty(), plan_lease);
+    stmt = std::move(outcome.stmt);
+    plan_cacheable = outcome.cacheable;
+    if (outcome.passes_e0) plan_flag_guard.Pass();
+  } else {
+    stmt = client_session->connection->Get().Prepare(effective_sql);
+  }
 
   if (stmt->success) {
     // Block writes to the GizmoSQL system catalog regardless of role or
@@ -1173,6 +2559,9 @@ arrow::Result<std::shared_ptr<DuckDBStatement>> DuckDBStatement::Create(
   std::shared_ptr<DuckDBStatement> result(new DuckDBStatement(
       client_session, handle, stmt, log_level, log_queries, override_schema, is_internal,
       flight_method));
+  if (PlanCacheEnabled()) {
+    RegisterStatement(result.get(), plan_cacheable, plan_lease);
+  }
 
   // Bind the gizmosql_settings() values (if this statement referenced it).
   if (!settings_binds.empty()) {
@@ -1194,12 +2583,32 @@ arrow::Result<std::shared_ptr<DuckDBStatement>> DuckDBStatement::Create(
   return result;
 }
 
+arrow::Status DuckDBStatement::ReuseForDoGet() {
+  ARROW_ASSIGN_OR_RAISE(auto session, GetSession());
+  ARROW_ASSIGN_OR_RAISE(auto log_threshold, GetSessionOrServerLogLevel(session));
+  session->active_sql_handle = statement_id_;
+  if (!is_internal_) {
+    session->TouchSqlActivity();
+  }
+  // DoGetStatement creates its statement with no display severity of its own (INFO)
+  log_level_ = std::nullopt;
+  if (log_queries_) {
+    GIZMOSQL_LOGKV_SESSION_DYNAMIC_AT(
+        log_threshold, arrow::util::ArrowLogLevel::ARROW_INFO,
+        session, "Client is attempting to run a SQL command",
+        {"kind", "sql"}, {"status", "reused"}, {"statement_id", statement_id_},
+        {"sql", logged_sql_}, {"is_internal", is_internal_ ? "true" : "false"},
+        {"flight_method", "DoGetStatement"});
+  }
+  return arrow::Status::OK();
+}
+
 arrow::Result<std::shared_ptr<DuckDBStatement>> DuckDBStatement::Create(
     const std::shared_ptr<ClientSession>& client_session, const std::string& sql,
     const std::optional<arrow::util::ArrowLogLevel>& log_level, const bool& log_queries,
     const std::shared_ptr<arrow::Schema>& override_schema,
     const std::string& flight_method, bool is_internal) {
-  std::string handle = boost::uuids::to_string(boost::uuids::random_generator()());
+  std::string handle = NewUuid();
   return DuckDBStatement::Create(client_session, handle, sql, log_level, log_queries,
                                  override_schema, flight_method, is_internal);
 }
@@ -1777,7 +3186,21 @@ arrow::Status DuckDBStatement::HandleGizmoSQLSet() {
   return arrow::Status::OK();
 }
 
-DuckDBStatement::~DuckDBStatement() {}
+DuckDBStatement::~DuckDBStatement() {
+  // The plan cache's lease returns once this statement's own holders of the plan -
+  // its result and its PreparedStatement - are released.
+  if (PlanCacheEnabled()) {
+    PlanLease lease;
+    ForgetStatement(this, lease);
+    if (lease.entry) {
+      query_result_.reset();
+      stmt_.reset();
+      if (AsyncTeardownEnabled() && client_context_) {
+        lease.db = client_context_->db;  // the lease's clear hands its aggregate states on
+      }
+    }
+  }
+}
 
 DuckDBStatement::DuckDBStatement(const std::shared_ptr<ClientSession>& client_session,
                                  const std::string& handle,
@@ -1840,6 +3263,10 @@ DuckDBStatement::DuckDBStatement(const std::shared_ptr<ClientSession>& client_se
 }
 
 arrow::Result<int> DuckDBStatement::Execute() {
+  // Every execution of a statement that is not cacheable is inside a
+  // generation pair, closed on every way out (a cancel and an exception included).
+  GenerationPair plan_pair(PlanCacheEnabled() && !StatementCacheable(this));
+
   // The attached Flight call (if any) is only valid for this Execute(); never
   // let a later Execute() on a reused (prepared) statement see a stale one.
   struct ClearCallContext {
@@ -1848,6 +3275,7 @@ arrow::Result<int> DuckDBStatement::Execute() {
   } clear_call_context{call_context_};
 
   ARROW_ASSIGN_OR_RAISE(auto session, GetSession());
+  CountSessionStatement(session->session_id);
 
   // Mark the session busy for the idle-session sweeper for exactly the
   // duration of execution, on every exit path (RAII).
@@ -1879,7 +3307,7 @@ arrow::Result<int> DuckDBStatement::Execute() {
 #endif
 
   // Generate execution ID for tracing (matches instrumentation table)
-  std::string execution_id = boost::uuids::to_string(boost::uuids::random_generator()());
+  std::string execution_id = NewUuid();
 
 #ifdef GIZMOSQL_ENTERPRISE
   // Serialize bind parameters for instrumentation
@@ -2068,7 +3496,7 @@ arrow::Result<int> DuckDBStatement::Execute() {
 #endif
 
   // Launch execution in a separate thread
-  auto future = std::async(
+  auto future = LaunchStatement(
       std::launch::async, [this, session, query_timeout, log_threshold, log_level
 #ifdef GIZMOSQL_WITH_OPENTELEMETRY
                            ,
@@ -2143,7 +3571,13 @@ arrow::Result<int> DuckDBStatement::Execute() {
                 {"flight_method", flight_method_});
           }
 
-          query_result_ = stmt_->Execute(bind_parameters);
+          // with the plan cache enabled, a statement that writes is executed
+          // materialized, so its commit precedes its pair's post-bump
+          if (PlanCacheEnabled() && !stmt_->data->properties.IsReadOnly()) {
+            query_result_ = stmt_->Execute(bind_parameters, /*allow_stream_result=*/false);
+          } else {
+            query_result_ = stmt_->Execute(bind_parameters);
+          }
 
           session->active_sql_handle = "";
 
@@ -2162,6 +3596,7 @@ arrow::Result<int> DuckDBStatement::Execute() {
 
         return 0;  // Success
       });
+  WaitOnUnwind wait_on_unwind{future};
 
   std::future_status status;
   // Define timeout duration

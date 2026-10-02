@@ -17,8 +17,10 @@
 
 #include "flight_connection.hpp"
 #include "oauth_flow.hpp"
+#include "../duckdb/tuning_defaults.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -32,6 +34,7 @@
 #pragma comment(lib, "crypt32.lib")
 #endif
 
+#include <arrow/flight/sql/server.h>
 #include <arrow/scalar.h>
 #include <arrow/table.h>
 #include <nlohmann/json.hpp>
@@ -327,6 +330,36 @@ static bool IsCancelledStatus(const arrow::Status& st) {
          st.ToString().find("INTERRUPT") != std::string::npos;
 }
 
+// One RPC per statement (kOneRpcPerStatement); off, ExecuteQuery is GetFlightInfo then
+// DoGet as before.
+static bool OneRpcEnabled() {
+  return gizmosql::kOneRpcPerStatement;
+}
+
+// The server's ticket-handle sniff (DecodeTransactionQuery): a query part that
+// starts with "tkt-" and has ':' at index 40 is read as a statement handle, so
+// such a statement keeps the GetFlightInfo path.
+static bool LooksLikeTicketHandle(const std::string& sql) {
+  return sql.rfind("tkt-", 0) == 0 && sql.size() > 40 && sql[40] == ':';
+}
+
+// The FlightInfo GetFlightInfo would return for a statement outside a
+// transaction, built locally: one endpoint whose ticket is the
+// <transaction_id>:<query> ticket with an empty transaction id, which the
+// server's DoGetStatement prepares from the SQL text; total_records -1, as the
+// server reports it.
+static arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>> OneRpcInfo(
+    const std::string& sql) {
+  ARROW_ASSIGN_OR_RAISE(auto ticket,
+                        arrow::flight::sql::CreateStatementQueryTicket(":" + sql));
+  arrow::flight::FlightInfo::Data data;
+  data.endpoints.emplace_back(arrow::flight::Ticket{std::move(ticket)},
+                              std::vector<arrow::flight::Location>{}, std::nullopt, "");
+  data.total_records = -1;
+  data.total_bytes = -1;
+  return std::make_unique<arrow::flight::FlightInfo>(std::move(data));
+}
+
 
 arrow::Result<QueryResult> FlightConnection::ExecuteQuery(
     const std::string& sql, int64_t row_limit) {
@@ -343,11 +376,18 @@ arrow::Result<QueryResult> FlightConnection::ExecuteQuery(
     return st;
   };
 
-  auto info_result = client_->Execute(call_options_, sql);
-  if (!info_result.ok()) {
-    return check_cancel(info_result.status());
+  // Enabled, the statement is sent as one DoGet of a locally built ticket instead
+  // of GetFlightInfo followed by DoGet.
+  std::unique_ptr<arrow::flight::FlightInfo> info;
+  if (OneRpcEnabled() && !LooksLikeTicketHandle(sql)) {
+    ARROW_ASSIGN_OR_RAISE(info, OneRpcInfo(sql));
+  } else {
+    auto info_result = client_->Execute(call_options_, sql);
+    if (!info_result.ok()) {
+      return check_cancel(info_result.status());
+    }
+    info = std::move(*info_result);
   }
-  auto& info = *info_result;
 
   int64_t server_total_records = info->total_records();
 

@@ -45,6 +45,20 @@ namespace gizmosql::ddb {
 bool CatalogExistsOnConnection(duckdb::Connection& connection,
                                const std::string& catalog_name);
 
+/// Prepare once: the number of statements the session `session_id` has begun to run
+/// since its first call here (each DuckDBStatement::Execute, and each statement the
+/// server runs for the session itself: transaction control, USE, an ingest).
+/// DoGetStatement reuses the statement a GetFlightInfoStatement prepared only if this has
+/// not moved since that GetFlightInfo began.
+uint64_t SessionStatementCount(const std::string& session_id);
+
+/// Prepare once: count a statement the session begins (nothing for a session that has
+/// not called SessionStatementCount).
+void CountSessionStatement(const std::string& session_id);
+
+/// Prepare once: drop the session's count (on each path that erases the session).
+void ForgetSessionStatementCount(const std::string& session_id);
+
 #ifdef GIZMOSQL_ENTERPRISE
 class StatementInstrumentation;
 class ExecutionInstrumentation;
@@ -104,6 +118,13 @@ class DuckDBStatement {
   }
 
   std::shared_ptr<duckdb::PreparedStatement> GetDuckDBStmt() const;
+
+  /// \brief Make a statement GetFlightInfoStatement prepared the one DoGetStatement
+  ///        executes (prepare once per statement), doing what Create() does for a
+  ///        DoGet statement: mark it the session's active statement, touch the session's
+  ///        SQL activity, give it a user query's display severity (INFO) and log it once
+  ///        (status "reused").
+  arrow::Status ReuseForDoGet();
 
   /// \brief Executes an UPDATE, INSERT or DELETE statement.
   /// \return              The number of rows changed by execution.

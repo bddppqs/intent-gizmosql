@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <functional>
 #include <chrono>
+#include <cstdlib>
 #include <map>
 #include <random>
 #include <regex>
@@ -62,6 +63,7 @@
 #include "telemetry_middleware.h"
 #include "flight_sql_fwd.h"
 #include "shutdown_state.h"
+#include "tuning_defaults.h"
 #include "session_context.h"
 #include "request_ctx.h"
 #ifdef GIZMOSQL_ENTERPRISE
@@ -77,7 +79,38 @@ using arrow::Status;
 namespace sql = flight::sql;
 
 namespace gizmosql::ddb {
+
+// The plan cache (defined in duckdb_statement.cpp): the generation pairs, the
+// server-own statement test, the primary catalog and the per-session records.
+bool PlanCacheEnabled();
+void PlanCachePairBegin();
+void PlanCachePairEnd();
+bool PlanCacheServerTextPairs(duckdb::Connection& connection, const std::string& sql);
+void PlanCacheSetPrimaryCatalog(const duckdb::DatabaseInstance* db, const std::string& name);
+void PlanCacheFlagSession(const std::string& session_id);
+void PlanCacheForgetSession(const std::string& session_id);
+// Async teardown (defined in duckdb_statement.cpp): wait for every pending reap.
+void DrainTeardownReaper();
+
 namespace {
+
+// The plan cache's generation pair: a pre-bump at construction and its one post-bump at destruction, around
+// every execution on a session's connection or a server connection outside
+// DuckDBStatement::Execute() (a no-op with the cache off).
+class GenerationPair {
+ public:
+  explicit GenerationPair(bool paired = true) : paired_(paired) {
+    if (paired_) PlanCachePairBegin();
+  }
+  GenerationPair(const GenerationPair&) = delete;
+  GenerationPair& operator=(const GenerationPair&) = delete;
+  ~GenerationPair() {
+    if (paired_) PlanCachePairEnd();
+  }
+
+ private:
+  bool paired_;
+};
 
 inline std::shared_ptr<::gizmosql::TelemetrySpanScope> ActivateTelemetryScope(
     const flight::ServerCallContext& context) {
@@ -295,6 +328,7 @@ struct CatalogEntryRow {
 // from duckdb_databases(). nullopt = the session's current database.
 Result<std::vector<std::string>> ResolveCatalogNames(
     duckdb::Connection& conn, const std::optional<std::string>& like_pattern) {
+  GenerationPair plan_pair;
   std::vector<std::string> names;
   if (!like_pattern.has_value()) {
     names.push_back(duckdb::DatabaseManager::GetDefaultDatabase(*conn.context));
@@ -331,6 +365,7 @@ Result<std::vector<std::string>> ResolveCatalogNames(
 Result<std::vector<CatalogEntryRow>> ScanCatalogEntries(
     duckdb::Connection& conn, const std::vector<std::string>& catalog_names,
     bool include_tables) {
+  GenerationPair plan_pair;
   std::vector<CatalogEntryRow> rows;
   auto& context = *conn.context;
   try {
@@ -400,8 +435,11 @@ void FilterRowsByCatalogVisibility(const std::shared_ptr<ClientSession>& client_
     instr_mgr = server->GetInstrumentationManager();
     log_catalog = server->GetLogCatalog();
   }
-  auto allowed_vec = gizmosql::enterprise::GetAllowedCatalogs(
-      *client_session, client_session->connection->Get(), instr_mgr, log_catalog);
+  auto allowed_vec = [&] {
+    GenerationPair plan_pair;
+    return gizmosql::enterprise::GetAllowedCatalogs(
+        *client_session, client_session->connection->Get(), instr_mgr, log_catalog);
+  }();
   if (allowed_vec.empty()) return;
   std::unordered_set<std::string> allowed(allowed_vec.begin(), allowed_vec.end());
   rows.erase(std::remove_if(rows.begin(), rows.end(),
@@ -680,6 +718,21 @@ std::string PrepareQueryForGetImportedOrExportedKeys(const std::string& filter) 
          filter + R"( ORDER BY
   pk_catalog_name, pk_schema_name, pk_table_name, pk_key_name, key_sequence)";
 }
+
+// Prepare once per statement: the statement GetFlightInfoStatement prepares is
+// carried to DoGetStatement through a single-use, session-bound handle in the ticket, so
+// the second Prepare (a full parse, bind and optimize) is not run; any miss falls back to
+// the SQL text.
+constexpr std::string_view kTicketHandlePrefix = "tkt-";
+constexpr size_t kTicketHandleLength = 40;  // the prefix and a 36-character UUID
+constexpr auto kTicketStatementTtl = std::chrono::seconds(60);
+constexpr size_t kTicketStatementsPerSession = 64;
+
+// Prepare once (kPrepareOnce); off, the ticket carries no handle and DoGet prepares again.
+bool PrepareOnceEnabled() {
+  return gizmosql::kPrepareOnce;
+}
+
 }  // namespace
 
 class DuckDBFlightSqlServer::Impl {
@@ -731,6 +784,18 @@ class DuckDBFlightSqlServer::Impl {
 
   // Set of killed session IDs - prevents reconnection with a killed session
   std::unordered_set<std::string> killed_session_ids_;
+
+  // Prepare once: session id -> ticket handle -> the statement its GetFlightInfo
+  // prepared. Taken after sessions_mutex_ when both are held; never held while
+  // sessions_mutex_ is taken.
+  struct TicketStatement {
+    std::shared_ptr<DuckDBStatement> statement;
+    std::chrono::steady_clock::time_point registered;
+    uint64_t statements;  // SessionStatementCount when its GetFlightInfo began
+  };
+  using TicketStatements = std::unordered_map<std::string, TicketStatement>;
+  std::unordered_map<std::string, TicketStatements> ticket_statements_;
+  std::mutex ticket_statements_mutex_;
 
   static std::optional<std::string> SessionValueToString(
       const flight::SessionOptionValue& v) {
@@ -824,7 +889,9 @@ class DuckDBFlightSqlServer::Impl {
           // Remove the killed session from the map
           {
             std::unique_lock write_lock(sessions_mutex_);
+            EraseTicketStatements(session_id);
             client_sessions_.erase(session_id);
+            PlanCacheForgetSession(session_id);
             killed_session_ids_.insert(session_id);
           }
           return Status::Invalid(
@@ -905,7 +972,9 @@ class DuckDBFlightSqlServer::Impl {
       if (auto it = client_sessions_.find(session_id); it != client_sessions_.end()) {
         // Another thread won the race – but check if it was killed
         if (it->second->kill_requested) {
+          EraseTicketStatements(session_id);
           client_sessions_.erase(session_id);
+          PlanCacheForgetSession(session_id);
           killed_session_ids_.insert(session_id);
           return Status::Invalid(
               "Your session has been killed. Please re-connect.");
@@ -965,18 +1034,31 @@ class DuckDBFlightSqlServer::Impl {
     return cs->connection;
   }
 
-  // Create a Ticket that combines a query and a transaction ID.
+  struct DecodedTransactionQuery {
+    std::string query;
+    std::string transaction_id;
+    std::string handle;  // a plan-once ticket handle, empty in a ticket without one
+  };
+
+  // Create a Ticket that combines a query, a transaction ID and, when plan-once
+  // registered the statement, its handle: <transaction_id>:<handle>:<query>, else
+  // <transaction_id>:<query>.
   static Result<flight::Ticket> EncodeTransactionQuery(
-      const std::string& query, const std::string& transaction_id) {
+      const std::string& query, const std::string& transaction_id,
+      const std::string& handle = "") {
     std::string transaction_query = transaction_id;
     transaction_query += ':';
+    if (!handle.empty()) {
+      transaction_query += handle;
+      transaction_query += ':';
+    }
     transaction_query += query;
     ARROW_ASSIGN_OR_RAISE(auto ticket_string,
                           sql::CreateStatementQueryTicket(transaction_query));
     return flight::Ticket{std::move(ticket_string)};
   }
 
-  static Result<std::pair<std::string, std::string>> DecodeTransactionQuery(
+  static Result<DecodedTransactionQuery> DecodeTransactionQuery(
       const std::string& ticket) {
     auto divider = ticket.find(':');
     if (divider == std::string::npos) {
@@ -984,7 +1066,121 @@ class DuckDBFlightSqlServer::Impl {
     }
     std::string transaction_id = ticket.substr(0, divider);
     std::string query = ticket.substr(divider + 1);
-    return std::make_pair(std::move(query), std::move(transaction_id));
+    std::string handle;
+    if (query.starts_with(kTicketHandlePrefix) && query.size() > kTicketHandleLength &&
+        query[kTicketHandleLength] == ':') {
+      handle = query.substr(0, kTicketHandleLength);
+      query.erase(0, kTicketHandleLength + 1);
+    }
+    return DecodedTransactionQuery{std::move(query), std::move(transaction_id),
+                                   std::move(handle)};
+  }
+
+  // Prepare once: drop the entries of one session that can no longer be reused into
+  // `dropped`: the session began a statement after their GetFlightInfo began (their
+  // statements count is not `statements_now`), or they are older than
+  // kTicketStatementTtl.
+  static void DropStaleTicketStatements(
+      TicketStatements& entries, uint64_t statements_now,
+      std::chrono::steady_clock::time_point now,
+      std::vector<std::shared_ptr<DuckDBStatement>>& dropped) {
+    for (auto it = entries.begin(); it != entries.end();) {
+      if (it->second.statements != statements_now ||
+          now - it->second.registered > kTicketStatementTtl) {
+        dropped.push_back(std::move(it->second.statement));
+        it = entries.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  // Prepare once: keep the statement under `handle` for its session until DoGet takes it,
+  // the session begins another statement (then DoGet prepares again), it is older than
+  // kTicketStatementTtl, the session's (kTicketStatementsPerSession + 1)th registration
+  // evicts it as the oldest, or the session is erased. `statements` is the session's
+  // SessionStatementCount when this GetFlightInfo began and `statements_now` its count
+  // now: a statement begun in between (one that GetFlightInfo itself ran included) leaves
+  // this one unregistered.
+  void RegisterTicketStatement(const std::string& session_id, const std::string& handle,
+                               std::shared_ptr<DuckDBStatement> statement,
+                               uint64_t statements, uint64_t statements_now) {
+    std::vector<std::shared_ptr<DuckDBStatement>> dropped;  // destroyed after the lock
+    {
+      const auto now = std::chrono::steady_clock::now();
+      std::lock_guard<std::mutex> lock(ticket_statements_mutex_);
+      auto& entries = ticket_statements_[session_id];
+      DropStaleTicketStatements(entries, statements_now, now, dropped);
+      const bool fresh = statements == statements_now;
+      if (fresh) {
+        while (entries.size() >= kTicketStatementsPerSession) {
+          auto oldest = std::min_element(
+              entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+                return a.second.registered < b.second.registered;
+              });
+          dropped.push_back(std::move(oldest->second.statement));
+          entries.erase(oldest);
+        }
+        entries.emplace(handle, TicketStatement{std::move(statement), now, statements});
+      }
+      if (entries.empty()) {
+        ticket_statements_.erase(session_id);
+      }
+      if (!fresh) {
+        dropped.push_back(std::move(statement));
+      }
+    }
+    // A session erased while its GetFlightInfo ran must not keep the entry (it holds the
+    // session's ClientContext).
+    bool alive;
+    {
+      std::shared_lock read_lock(sessions_mutex_);
+      auto it = client_sessions_.find(session_id);
+      alive = it != client_sessions_.end() && !it->second->kill_requested;
+    }
+    if (!alive) {
+      EraseTicketStatements(session_id);
+    }
+  }
+
+  // Prepare once: the statement registered under `handle` for this session, erased (single
+  // use); nullptr when there is none, it expired, or the session began a statement after
+  // its GetFlightInfo began (`statements_now` is the session's SessionStatementCount
+  // now). The session's other stale entries are dropped with it.
+  std::shared_ptr<DuckDBStatement> TakeTicketStatement(const std::string& session_id,
+                                                       const std::string& handle,
+                                                       uint64_t statements_now) {
+    std::shared_ptr<DuckDBStatement> taken;
+    std::vector<std::shared_ptr<DuckDBStatement>> dropped;  // destroyed after the lock
+    std::lock_guard<std::mutex> lock(ticket_statements_mutex_);
+    if (auto session = ticket_statements_.find(session_id);
+        session != ticket_statements_.end()) {
+      auto& entries = session->second;
+      DropStaleTicketStatements(entries, statements_now, std::chrono::steady_clock::now(),
+                                dropped);
+      if (auto it = entries.find(handle); it != entries.end()) {
+        taken = std::move(it->second.statement);
+        entries.erase(it);
+      }
+      if (entries.empty()) {
+        ticket_statements_.erase(session);
+      }
+    }
+    return taken;
+  }
+
+  // Prepare once: every entry of an erased session (called on each path that erases a
+  // session, before the session itself goes).
+  void EraseTicketStatements(const std::string& session_id) {
+    TicketStatements dropped;  // destroyed after the lock
+    {
+      std::lock_guard<std::mutex> lock(ticket_statements_mutex_);
+      if (auto it = ticket_statements_.find(session_id); it != ticket_statements_.end()) {
+        dropped.swap(it->second);
+        ticket_statements_.erase(it);
+      }
+    }
+    ForgetSessionStatementCount(session_id);
   }
 
  public:
@@ -1070,10 +1266,17 @@ class DuckDBFlightSqlServer::Impl {
     auto session_count = client_sessions_.size();
     // Session destructors handle active connection counter decrement,
     // prepared statement cleanup, and DuckDB connection counter decrement
+    {
+      // destroyed after the lock
+      std::unordered_map<std::string, TicketStatements> dropped;
+      std::lock_guard<std::mutex> ticket_lock(ticket_statements_mutex_);
+      dropped.swap(ticket_statements_);
+    }
     client_sessions_.clear();
     if (session_count > 0) {
       GIZMOSQL_LOG(INFO) << "Released " << session_count << " active session(s) during shutdown";
     }
+    DrainTeardownReaper();  // no aggregate state outlives the shutdown
   }
 
   void StartIdleSessionSweeper() {
@@ -1210,9 +1413,11 @@ class DuckDBFlightSqlServer::Impl {
     std::unique_lock write_lock(sessions_mutex_);
     auto it = client_sessions_.find(session_id);
     if (it != client_sessions_.end()) {
+      EraseTicketStatements(session_id);
       // Session destructor handles active connection counter decrement,
       // prepared statement cleanup, and DuckDB connection counter decrement
       client_sessions_.erase(it);
+      PlanCacheForgetSession(session_id);
       if (was_killed) {
         killed_session_ids_.insert(session_id);
       }
@@ -1221,7 +1426,10 @@ class DuckDBFlightSqlServer::Impl {
     return arrow::Status::KeyError("Session not found: " + session_id);
   }
 
-  ~Impl() { StopIdleSessionSweeper(); }
+  ~Impl() {
+    StopIdleSessionSweeper();
+    DrainTeardownReaper();  // before the database instance goes
+  }
 
   Result<std::unique_ptr<flight::FlightInfo>> GetFlightInfoStatement(
       const flight::ServerCallContext& context, const sql::StatementQuery& command,
@@ -1229,6 +1437,9 @@ class DuckDBFlightSqlServer::Impl {
     ARROW_RETURN_NOT_OK(RejectIfDraining());
     const std::string& query = command.query;
     ARROW_ASSIGN_OR_RAISE(auto client_session, GetClientSession(context));
+    // Prepare once: the session's statement count before this statement is prepared
+    const uint64_t statements =
+        PrepareOnceEnabled() ? SessionStatementCount(client_session->session_id) : 0;
     ARROW_ASSIGN_OR_RAISE(
         auto statement,
         DuckDBStatement::Create(client_session, query,
@@ -1236,8 +1447,18 @@ class DuckDBFlightSqlServer::Impl {
                                 nullptr, "GetFlightInfoStatement", false))
     statement->SetCallContext(&context);
     ARROW_ASSIGN_OR_RAISE(auto schema, statement->GetSchema())
+    std::string handle;
+    if (PrepareOnceEnabled()) {
+      handle = std::string(kTicketHandlePrefix) +
+               boost::uuids::to_string(boost::uuids::random_generator()());
+    }
     ARROW_ASSIGN_OR_RAISE(auto ticket,
-                          EncodeTransactionQuery(query, command.transaction_id))
+                          EncodeTransactionQuery(query, command.transaction_id, handle))
+    if (!handle.empty()) {
+      statement->SetCallContext(nullptr);  // this call ends here; DoGet attaches its own
+      RegisterTicketStatement(client_session->session_id, handle, statement, statements,
+                              SessionStatementCount(client_session->session_id));
+    }
     std::vector<flight::FlightEndpoint> endpoints{
         flight::FlightEndpoint{std::move(ticket), {}, std::nullopt, ""}};
     ARROW_ASSIGN_OR_RAISE(
@@ -1248,14 +1469,24 @@ class DuckDBFlightSqlServer::Impl {
   Result<std::unique_ptr<flight::FlightDataStream>> DoGetStatement(
       const flight::ServerCallContext& context,
       const sql::StatementQueryTicket& command) {
-    ARROW_ASSIGN_OR_RAISE(auto pair, DecodeTransactionQuery(command.statement_handle))
-    const std::string& sql = pair.first;
-    const std::string transaction_id = pair.second;
+    ARROW_ASSIGN_OR_RAISE(auto decoded, DecodeTransactionQuery(command.statement_handle))
+    const std::string& sql = decoded.query;
+    const std::string transaction_id = decoded.transaction_id;
     ARROW_ASSIGN_OR_RAISE(auto client_session, GetClientSession(context));
-    ARROW_ASSIGN_OR_RAISE(
-        auto statement,
-        DuckDBStatement::Create(client_session, sql, std::nullopt, print_queries_,
-                                nullptr, "DoGetStatement", false))
+    std::shared_ptr<DuckDBStatement> statement;
+    if (!decoded.handle.empty()) {
+      statement = TakeTicketStatement(client_session->session_id, decoded.handle,
+                                      SessionStatementCount(client_session->session_id));
+      if (statement) {
+        ARROW_RETURN_NOT_OK(statement->ReuseForDoGet());
+      }
+    }
+    if (!statement) {
+      ARROW_ASSIGN_OR_RAISE(
+          statement,
+          DuckDBStatement::Create(client_session, sql, std::nullopt, print_queries_,
+                                  nullptr, "DoGetStatement", false))
+    }
     statement->SetCallContext(&context);
     ARROW_ASSIGN_OR_RAISE(auto reader, DuckDBStatementBatchReader::Create(statement))
 
@@ -1805,7 +2036,13 @@ class DuckDBFlightSqlServer::Impl {
                                               const flight::sql::StatementIngest& command,
                                               flight::FlightMessageReader* reader) {
     std::string status;
+    // one generation pair from the handler's entry, before TableExists, to its exit
+    // after the commit; a temporary ingest flags the session
+    GenerationPair plan_pair;
     ARROW_ASSIGN_OR_RAISE(auto client_session, GetClientSession(context));
+    if (command.temporary) {
+      PlanCacheFlagSession(client_session->session_id);
+    }
 
     GIZMOSQL_LOG_SCOPE_STATUS(
         DEBUG, "DuckDBFlightSqlServer::DoPutCommandStatementIngest", status,
@@ -1813,6 +2050,7 @@ class DuckDBFlightSqlServer::Impl {
         {"user", client_session->username}, {"role", client_session->role});
 
     client_session->TouchSqlActivity();
+    CountSessionStatement(client_session->session_id);
 
     // 1. Build a fully qualified target table name
     std::string target_table;
@@ -1949,6 +2187,7 @@ class DuckDBFlightSqlServer::Impl {
   Result<sql::ActionBeginTransactionResult> BeginTransaction(
       const flight::ServerCallContext& context,
       const sql::ActionBeginTransactionRequest& request) {
+    GenerationPair plan_pair;
     std::string handle = boost::uuids::to_string(boost::uuids::random_generator()());
     ARROW_ASSIGN_OR_RAISE(auto client_session, GetClientSession(context));
     std::unique_lock write_lock(transactions_mutex_);
@@ -1961,6 +2200,7 @@ class DuckDBFlightSqlServer::Impl {
 
   Status EndTransaction(const flight::ServerCallContext& context,
                         const sql::ActionEndTransactionRequest& request) {
+    GenerationPair plan_pair;
     Status status;
     ARROW_ASSIGN_OR_RAISE(auto client_session, GetClientSession(context));
     {
@@ -2006,6 +2246,7 @@ class DuckDBFlightSqlServer::Impl {
   Result<flight::SetSessionOptionsResult> SetSessionOptions(
       const flight::ServerCallContext& context,
       const flight::SetSessionOptionsRequest& request) {
+    GenerationPair plan_pair;
     flight::SetSessionOptionsResult res;
 
     ARROW_ASSIGN_OR_RAISE(auto client_session, GetClientSession(context));
@@ -2041,6 +2282,7 @@ class DuckDBFlightSqlServer::Impl {
   Result<flight::GetSessionOptionsResult> GetSessionOptions(
       const flight::ServerCallContext& context,
       const flight::GetSessionOptionsRequest& request) {
+    GenerationPair plan_pair;
     flight::GetSessionOptionsResult res;
 
     // Non-creating lookup: GetSessionOptions doubles as a liveness probe (see
@@ -2102,11 +2344,14 @@ class DuckDBFlightSqlServer::Impl {
   Status ExecuteSql(const std::string& sql) const {
     // We do not have a call context, so just grab a new connection to the instance
     gizmosql::TrackedDuckDBConnection connection(*db_instance_);
+    // pairs unless the text passes the statement test (the health check's SELECT 1)
+    GenerationPair plan_pair(PlanCacheServerTextPairs(connection.Get(), sql));
     return ExecuteSql(connection.Get(), sql);
   }
 
   static Status ExecuteSql(const std::shared_ptr<ClientSession>& client_session,
                            const std::string& sql) {
+    CountSessionStatement(client_session->session_id);
     return ExecuteSql(client_session->connection->Get(), sql);
   }
 
@@ -2135,6 +2380,8 @@ class DuckDBFlightSqlServer::Impl {
   Result<std::vector<std::string>> ExecuteSqlAndGetStringVector(const std::string& sql) {
     // We do not have a call context, so just grab a new connection to the instance
     gizmosql::TrackedDuckDBConnection connection(*db_instance_);
+    // pairs unless the text passes the statement test
+    GenerationPair plan_pair(PlanCacheServerTextPairs(connection.Get(), sql));
 
     return ExecuteSqlAndGetStringVector(connection.Get(), sql);
   }
@@ -2259,6 +2506,20 @@ Result<std::shared_ptr<DuckDBFlightSqlServer>> DuckDBFlightSqlServer::Create(
   }
 
   auto db = std::make_shared<duckdb::DuckDB>(db_location, &config);
+
+  // The plan cache: the primary catalog's name, read once from a fresh connection (never
+  // a session's search-path default)
+  if (PlanCacheEnabled()) {
+    try {
+      gizmosql::TrackedDuckDBConnection primary_connection(*db);
+      PlanCacheSetPrimaryCatalog(
+          db->instance.get(),
+          duckdb::DatabaseManager::GetDefaultDatabase(*primary_connection.Get().context));
+    } catch (const std::exception& ex) {
+      GIZMOSQL_LOG(WARNING) << "Plan cache: no primary catalog (" << ex.what()
+                            << "); no statement is cacheable";
+    }
+  }
 
   // Apply the DuckDB memory limit (global / instance-wide) if the operator set
   // one. Accepts DuckDB's own syntax ("8GB", "75%", ...). Empty => leave DuckDB's
