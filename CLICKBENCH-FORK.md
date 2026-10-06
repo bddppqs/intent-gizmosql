@@ -1,8 +1,9 @@
 # ClickBench build of GizmoSQL v1.38.0
 
 This repository is GizmoSQL v1.38.0 with the embedded DuckDB pinned to https://github.com/bddppqs/intent-duckdb at tag
-`v1.5.5-intent.2` (see that repository's `CLICKBENCH-FORK.md`). `v1.38.0-clickbench.1` was the first release;
-`v1.38.0-intent.2` is the one the ClickBench entry `intent-gizmosql` installs.
+`v1.5.5-intent.3` (see that repository's `CLICKBENCH-FORK.md`). `v1.38.0-clickbench.1` and `v1.38.0-intent.2`
+were the earlier releases; `v1.38.0-intent.3` is the one the ClickBench entry `intent-gizmosql` installs. Since
+`v1.38.0-intent.2`, only the DuckDB pin has changed.
 
 The server and client changes are listed in `CHANGELOG.md`: a statement is prepared once, statements run on persistent
 executor threads, the client sends each query as one request, and repeated read-only statements reuse a bounded cache of
