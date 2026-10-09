@@ -5,6 +5,12 @@ All notable changes to GizmoSQL will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.38.0-intent.8]
+
+### Changed
+- The embedded DuckDB is pinned to intent-duckdb v1.5.5-intent.8. intent.7 had no release of its own; its
+  changes are part of v1.5.5-intent.8.
+
 ## [1.38.0-intent.6]
 
 ### Changed
